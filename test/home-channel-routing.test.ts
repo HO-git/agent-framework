@@ -17,7 +17,9 @@ import { AgentFramework } from '../src/index.js';
 import { ChannelRegistry } from '../src/mcpl/channel-registry.js';
 import type { McplServerRegistry } from '../src/mcpl/server-registry.js';
 import type { FeatureSetManager } from '../src/mcpl/feature-set-manager.js';
-import { MockMembrane } from './helpers/mock-membrane.js';
+import { CapabilityGrant, ALL_CAPABILITY_PATHS } from '../src/mcpl/capability-grant.js';
+import type { ChannelContext } from '../src/mcpl/types.js';
+import { MockMembrane, createMockResponse } from './helpers/mock-membrane.js';
 
 const HOME = 'discord:g1:home';
 const BUSY = 'discord:g1:busy';
@@ -95,5 +97,134 @@ describe('FrameworkConfig.homeChannel reaches the ChannelRegistry', () => {
     (registry as unknown as { defaultPublishChannel: string | null }).defaultPublishChannel = BUSY;
     assert.equal(registry.resolveLocus('scout'), HOME);
     await framework.stop();
+  });
+});
+
+describe('homeChannel: a no-trigger turn is told, and published to, the home channel', () => {
+  let tempDir: string;
+  let membrane: MockMembrane;
+
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), 'home-channel-delivery-'));
+    membrane = new MockMembrane();
+  });
+
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+
+  /**
+   * A trunk agent on the real ChannelRegistry, with HOME and BUSY registered
+   * and open on a publish-capable mock server. Records every channels/publish
+   * and every channel context the turn is given (what the agent is told).
+   */
+  async function setup(homeChannel?: string) {
+    const framework = await AgentFramework.create({
+      storePath: join(tempDir, 'test.chronicle'),
+      membrane: membrane.asMembrane(),
+      agents: [{ name: 'scout', model: 'test-model', systemPrompt: 'You are scout.' }],
+      modules: [],
+      ...(homeChannel ? { homeChannel } : {}),
+    });
+    const internals = framework as unknown as {
+      initializeMcpl(servers: unknown[], routing?: unknown): Promise<void>;
+      channelRegistry: ChannelRegistry | null;
+      pendingRequests: Array<{ agentName: string; reason: string; source: string; timestamp: number }>;
+    };
+    await internals.initializeMcpl([]);
+    const registry = internals.channelRegistry!;
+
+    const published: string[] = [];
+    const server = {
+      grant: new CapabilityGrant(new Set(ALL_CAPABILITY_PATHS), []),
+      sendChannelsPublish: async (params: { channelId?: string }) => {
+        published.push(params.channelId ?? '');
+        return { delivered: true, messageId: `out-${published.length}` };
+      },
+    };
+    const raw = registry as unknown as {
+      serverRegistry: McplServerRegistry;
+      channels: Map<string, { serverId: string; descriptor: { id: string; type: string; label: string }; open: boolean }>;
+      defaultPublishChannel: string | null;
+      defaultPublishMessageId: string | null;
+    };
+    raw.serverRegistry = { getServer: () => server } as unknown as McplServerRegistry;
+    for (const id of [HOME, BUSY]) {
+      raw.channels.set(`discord:${id}`, { serverId: 'discord', descriptor: { id, type: 'discord', label: id }, open: true });
+    }
+
+    const told: Array<ChannelContext | undefined> = [];
+    const build = registry.buildChannelContext.bind(registry);
+    registry.buildChannelContext = (agentName?: string) => {
+      const ctx = build(agentName);
+      if (agentName === 'scout') told.push(ctx);
+      return ctx;
+    };
+
+    /** Run one heartbeat-style turn (no triggering channel) that says `text`. */
+    async function heartbeat(text: string) {
+      membrane.pushResponse(createMockResponse([{ type: 'text', text }]));
+      internals.pendingRequests.push({ agentName: 'scout', reason: 'heartbeat', source: 'framework', timestamp: Date.now() });
+      await framework.runUntilIdle();
+    }
+
+    /** Some other channel had activity: the global most-recent-inbound locus. */
+    function busyElsewhere() {
+      raw.defaultPublishChannel = BUSY;
+      raw.defaultPublishMessageId = 'busy-1';
+    }
+
+    function routingNotices(): string[] {
+      return framework.getAgent('scout')!.getContextManager().queryMessages({}).messages
+        .flatMap((m) => m.content)
+        .filter((b): b is { type: 'text'; text: string } => b.type === 'text' && b.text.startsWith('[routing]'))
+        .map((b) => b.text);
+    }
+
+    return { framework, published, told, heartbeat, busyElsewhere, routingNotices };
+  }
+
+  it('with activity in another channel, the heartbeat speaks in HOME, not the busy channel', async () => {
+    const t = await setup(HOME);
+    try {
+      t.busyElsewhere();
+      await t.heartbeat('heartbeat check-in');
+      assert.deepEqual(t.published, [HOME], 'published to the home channel only');
+      assert.ok(t.told.length > 0, 'the turn was given a channel context');
+      for (const ctx of t.told) {
+        assert.equal(ctx?.defaultOutgoing?.channelId, HOME, 'the agent is told its speech lands in HOME');
+      }
+      assert.ok(t.routingNotices().some((n) => n.includes(HOME)), 'the routing notice names HOME');
+      assert.ok(!t.routingNotices().some((n) => n.includes(BUSY)), 'and never the busy channel');
+    } finally {
+      await t.framework.stop();
+    }
+  });
+
+  it('with no prior inbound message at all, the heartbeat still speaks in HOME', async () => {
+    const t = await setup(HOME);
+    try {
+      await t.heartbeat('first words');
+      assert.deepEqual(t.published, [HOME]);
+      for (const ctx of t.told) {
+        assert.equal(ctx?.defaultOutgoing?.channelId, HOME);
+      }
+    } finally {
+      await t.framework.stop();
+    }
+  });
+
+  it('control: without homeChannel the same heartbeat follows the busy channel', async () => {
+    const t = await setup();
+    try {
+      t.busyElsewhere();
+      await t.heartbeat('heartbeat check-in');
+      assert.deepEqual(t.published, [BUSY]);
+      for (const ctx of t.told) {
+        assert.equal(ctx?.defaultOutgoing?.channelId, BUSY);
+      }
+    } finally {
+      await t.framework.stop();
+    }
   });
 });
