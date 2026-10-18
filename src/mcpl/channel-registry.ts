@@ -37,7 +37,10 @@ import type { McplServerRegistry } from './server-registry.js';
 import type { FeatureSetManager } from './feature-set-manager.js';
 import type { ToolDefinition, ToolResult, ProcessEvent } from '../types/index.js';
 import { expandCoreTags } from './tags.js';
-import { validateCoalescedContent } from './push-coalescer.js';
+import { coalesceRejectionReason, EmptyContentError, validateCoalescedContent } from './push-coalescer.js';
+import { isVisiblyEmptyContent } from './visible-content.js';
+import { logDetail, logValue } from './log-value.js';
+import { RefusalLines } from './refusal-lines.js';
 import { CapabilityGrant } from './capability-grant.js';
 
 // ============================================================================
@@ -248,7 +251,9 @@ interface McplChannelIncomingEvent {
 function convertBlock(block: McplContentBlock): ContentBlock {
   switch (block.type) {
     case 'text':
-      return { type: 'text', text: block.text };
+      // Text that isn't a string is no text, as the request sanitizer and
+      // the visible-content check already read it.
+      return { type: 'text', text: typeof block.text === 'string' ? block.text : '' };
 
     case 'image':
       if (isInlineContradiction(block)) {
@@ -256,24 +261,24 @@ function convertBlock(block: McplContentBlock): ContentBlock {
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
-      if (block.uri && block.disposition) {
+      if (isFilledString(block.uri) && block.disposition) {
         // RFC-005 uri-form media with a disposition claim: stub, do not
         // hand the URI to the provider or inline it.
         return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
       }
-      if (block.data && block.mimeType) {
+      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
           type: 'image',
           source: { type: 'base64', data: block.data, mediaType: block.mimeType },
         } as ContentBlock;
       }
-      if (block.uri) {
+      if (isFilledString(block.uri)) {
         return {
           type: 'image',
           source: { type: 'url', url: block.uri },
         } as ContentBlock;
       }
-      return { type: 'text', text: '[Image: no data]' };
+      return { type: 'text', text: isFilledString(block.data) ? '[Image: no media type]' : '[Image: no data]' };
 
     case 'audio':
       if (isInlineContradiction(block)) {
@@ -281,29 +286,41 @@ function convertBlock(block: McplContentBlock): ContentBlock {
         // closed, withhold the data (checked BEFORE the data branch).
         return { type: 'text', text: INLINE_WITHHELD_TEXT };
       }
-      if (block.uri && block.disposition) {
+      if (isFilledString(block.uri) && block.disposition) {
         // RFC-005 uri-form media with a disposition claim: stub, do not
         // hand the URI to the provider or inline it.
         return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
       }
-      if (block.data && block.mimeType) {
+      if (isFilledString(block.data) && isFilledString(block.mimeType)) {
         return {
           type: 'audio',
           source: { type: 'base64', data: block.data, mediaType: block.mimeType },
         } as ContentBlock;
       }
-      return { type: 'text', text: '[Audio: no data]' };
+      return { type: 'text', text: isFilledString(block.data) ? '[Audio: no media type]' : '[Audio: no data]' };
 
     case 'resource':
       // RFC-005: reference blocks become bounded stubs — never raw URIs
       // (a signed URL is a bearer credential that looks like a location).
       return { type: 'text', text: referenceStubOrNull(block, 'attachment on channel message') ?? '[reference]' };
 
-    default:
+    default: {
       // Unknown wire block types previously fell off the exhaustive switch
-      // and propagated `undefined` into ContentBlock[]. Fail visibly.
-      return { type: 'text', text: `[unrecognized content block: ${(block as { type?: string }).type ?? 'untyped'}]` };
+      // and propagated `undefined` into ContentBlock[]. Fail visibly. A type
+      // that isn't a string is no type, and is never converted to one: an
+      // object can throw when it is.
+      const type: unknown = (block as { type?: unknown }).type;
+      return { type: 'text', text: `[unrecognized content block: ${typeof type === 'string' ? type : 'untyped'}]` };
+    }
   }
+}
+
+/** A string with something in it: the only data, mimeType or uri a block's
+ *  source is built from, and the only uri that makes it a reference. Anything
+ *  else a sender puts there leaves the block without it, so conversion never
+ *  throws and never copies a non-string. */
+function isFilledString(value: unknown): value is string {
+  return typeof value === 'string' && value !== '';
 }
 
 // ============================================================================
@@ -511,17 +528,19 @@ interface ChannelRegistryOptions {
    */
   homeChannelResolver?: (agentName: string) => string | undefined;
   /**
-   * Resolve the channel that triggered an agent's CURRENT inference turn, by
-   * agent name. This is the fix for single-TRUNK agents (the only mode
+   * Resolve an agent's channel for its CURRENT inference turn, by agent name:
+   * the turn's locus once it has one, else the channel that triggered the
+   * turn. This is the fix for single-TRUNK agents (the only mode
    * connectome-host runs — it never exposes conversation forks). A trunk agent
    * has no fork home, so without this its plain-text speech falls back to the
    * process-global `defaultPublishChannel`, which tracks the most-recent inbound
    * across ALL channels and misroutes a reply to whichever channel last spoke
-   * under concurrency (item-3 redux). The framework tracks the triggering
-   * channel of the live turn per-agent and exposes it here; resolves to
-   * undefined for a heartbeat / no-trigger turn, which correctly keeps the
-   * global fallback. Consulted AFTER `homeChannelResolver` (a fork's home always
-   * wins), BEFORE `defaultPublishChannel`.
+   * under concurrency (item-3 redux). The framework keeps both on the live
+   * turn's routing state and exposes them here. For a heartbeat / no-trigger
+   * turn it resolves to undefined until the turn's locus is resolved, so that
+   * resolution takes the global fallback, which the turn then keeps.
+   * Consulted AFTER `homeChannelResolver` (a fork's home always wins), BEFORE
+   * `defaultPublishChannel`.
    */
   activeChannelResolver?: (agentName: string) => string | undefined;
   /**
@@ -535,6 +554,8 @@ interface ChannelRegistryOptions {
    * `discord:{guildId}:{channelId}`.
    */
   homeChannel?: string;
+  /** Whether this framework has EventGate and can honor skip_reply self-wakes. */
+  eventGatePresent?: boolean;
 }
 
 // ============================================================================
@@ -587,6 +608,10 @@ export class ChannelRegistry {
 
   /** Registered channels, keyed by `{serverId}:{channelId}`. */
   private channels = new Map<string, ChannelEntry>();
+
+  /** Holds back repeats of the line for a message refused because its
+   *  channel isn't registered (RefusalLines). */
+  private unknownChannelLines = new RefusalLines();
 
   /**
    * Most-recently-known label per channelId, replayed from
@@ -669,6 +694,7 @@ export class ChannelRegistry {
   private legacyPolicies = new Map<string, 'auto' | 'manual' | string[]>();
   private migratedLegacyPolicies = new Set<string>();
   private handleCoalescedIncoming?: ChannelRegistryOptions['handleCoalescedIncoming'];
+  private channelTools: ToolDefinition[];
 
   constructor(
     serverRegistry: McplServerRegistry,
@@ -685,6 +711,23 @@ export class ChannelRegistry {
     },
   ) {
     this.handleCoalescedIncoming = options?.handleCoalescedIncoming;
+    this.channelTools = CHANNEL_TOOL_DEFINITIONS.map((tool) => {
+      if (tool.name !== 'skip_reply' || options?.eventGatePresent === true) return tool;
+      const schema = tool.inputSchema as {
+        type: 'object';
+        properties: NonNullable<ToolDefinition['inputSchema']['properties']>;
+        required?: string[];
+      };
+      const { wake_in_seconds: _wake, ...properties } = schema.properties;
+      return {
+        ...tool,
+        description: tool.description.replace(
+          ' To end this turn but come back on your own shortly, set wake_in_seconds.',
+          '',
+        ),
+        inputSchema: { ...schema, properties },
+      };
+    });
     this.serverRegistry = serverRegistry;
     this.featureSetManager = featureSetManager;
     this.pushEventFn = pushEventFn;
@@ -861,6 +904,45 @@ export class ChannelRegistry {
   }
 
   /**
+   * A coalesced message the host refused. Until now the host said nothing, so
+   * a dropped message (agent-framework#266: every Discord message with a
+   * screenshot) left no trace where operators look. The sender gets the
+   * per-message result this lane gives: `coalesce_invalid` for a malformed
+   * item, or the thrown error's message for anything else. `answered` is the
+   * code that result stands for (-32602 for `coalesce_invalid`), and the
+   * reason follows it (coalesceRejectionReason): `coalesce-failed` when the
+   * host itself failed, `coalesce-invalid` when the sender's item was
+   * refused, with the failing `field` and the error's message as `detail`.
+   * The line prints the ids the sender sent, whatever their type; the trace
+   * carries them when they are strings.
+   */
+  private traceCoalesceRejection(
+    serverId: string,
+    message: { channelId?: unknown; messageId?: unknown } | null | undefined,
+    error: { field?: unknown; message: string },
+    answered: number,
+  ): void {
+    const reason = coalesceRejectionReason(answered);
+    const field = typeof error.field === 'string' && error.field ? error.field : undefined;
+    const channelId = typeof message?.channelId === 'string' ? message.channelId : '';
+    const messageId = typeof message?.messageId === 'string' && message.messageId ? message.messageId : undefined;
+    console.error(
+      `[channel-incoming-rejected] server=${serverId} channel=${logValue(message?.channelId ?? '')} ` +
+      `messageId=${logValue(message?.messageId ?? '')} ` +
+      `reason=${reason}${field ? ` field=${logValue(field)}` : ''}: ${logDetail(error.message)}`,
+    );
+    this.emitTraceFn({
+      type: 'mcpl:channel-incoming-rejected',
+      serverId,
+      channelId,
+      ...(messageId ? { messageId } : {}),
+      reason,
+      ...(field ? { field } : {}),
+      detail: error.message,
+    });
+  }
+
+  /**
    * Handle `channels/incoming` from a server.
    *
    * Converts each message's content, pushes McplChannelIncomingEvent to the
@@ -876,10 +958,20 @@ export class ChannelRegistry {
     for (const message of params.messages) {
       if (!message || typeof message.channelId !== 'string' || !message.channelId
         || typeof message.messageId !== 'string' || !message.messageId) {
+        // The same gate as admission below: with no coalescer wired, a
+        // message carrying `coalesce` is handled uncoalesced, and refused as
+        // any uncoalesced message without an identity is.
+        const coalescedItem = message?.coalesce !== undefined && !!this.handleCoalescedIncoming;
+        if (coalescedItem) {
+          this.traceCoalesceRejection(serverId, message, {
+            field: typeof message.channelId !== 'string' || !message.channelId ? 'channelId' : 'messageId',
+            message: 'a coalesced message needs a channelId and a messageId',
+          }, -32602);
+        }
         results.push({
           messageId: typeof message?.messageId === 'string' ? message.messageId : '',
           accepted: false,
-          reason: message?.coalesce !== undefined ? 'coalesce_invalid' : 'invalid channel/message identity',
+          reason: coalescedItem ? 'coalesce_invalid' : 'invalid channel/message identity',
         });
         continue;
       }
@@ -911,11 +1003,24 @@ export class ChannelRegistry {
       // routable entry rather than an open self-attested one.
       const incomingKey = `${serverId}:${message.channelId}`;
       if (!this.channels.has(incomingKey)) {
+        // Loud, coalesced or not, like every other refusal of a message, but
+        // at most once a minute per channel (RefusalLines): a server that
+        // never registered a busy channel would otherwise print a line for
+        // every message in it. Every refusal is traced.
+        const held = this.unknownChannelLines.admit(serverId, message.channelId);
+        if (held !== null) {
+          console.error(
+            `[channel-incoming-rejected] server=${serverId} channel=${logValue(message.channelId)} ` +
+            `messageId=${logValue(message.messageId)} reason=unknown-channel ` +
+            `(not registered, §14.5${held ? `; ${held} more since the last line` : ''})`,
+          );
+        }
         this.emitTraceFn({
           type: 'mcpl:channel-incoming-rejected',
           serverId,
           channelId: message.channelId,
-          reason: 'unknown channel — not registered (§14.5)',
+          messageId: message.messageId,
+          reason: 'unknown-channel',
         });
         results.push({
           messageId: message.messageId,
@@ -928,18 +1033,42 @@ export class ChannelRegistry {
       // ACCEPTED from here down: semantic processing only for admitted
       // messages. §16.3 core-tag closure, then content conversion.
       const coalesced = message.coalesce !== undefined && !!this.handleCoalescedIncoming;
+      // Only a coalescing retraction may be empty (pure withdrawal, RFC-006
+      // §6; the coalescer appends nothing for it). Any other message that
+      // shows the model nothing would wake it with no visible cause.
+      const emptyAllowed = coalesced && (message.coalesce as { retract?: unknown } | null)?.retract === true;
+      const rejectEmpty = () => {
+        console.error(`[channel-incoming-rejected] server=${serverId} channel=${logValue(message.channelId)} messageId=${logValue(message.messageId)} reason=empty-content`);
+        this.emitTraceFn({
+          type: 'mcpl:channel-incoming-rejected',
+          serverId,
+          channelId: message.channelId,
+          messageId: message.messageId,
+          reason: 'empty-content',
+        });
+        results.push({ messageId: message.messageId, accepted: false, reason: 'empty_content' });
+      };
       if (coalesced) {
         // RFC-006 §13: malformed content on a coalesced item is that item's
         // failure, not the batch's — check the shape before converting.
         try {
-          validateCoalescedContent(message.content);
+          validateCoalescedContent(message.content, { allowEmpty: emptyAllowed });
         } catch (error) {
-          results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+          if (error instanceof EmptyContentError) rejectEmpty();
+          else {
+            // Answered coalesce_invalid whatever the error's code: -32602.
+            this.traceCoalesceRejection(serverId, message, error as Error & { field?: string }, -32602);
+            results.push({ messageId: message.messageId, accepted: false, reason: 'coalesce_invalid' });
+          }
           continue;
         }
       }
       if (message.tags) message.tags = expandCoreTags(message.tags);
       const convertedContent: ContentBlock[] = message.content.map(convertBlock);
+      if (!emptyAllowed && isVisiblyEmptyContent(convertedContent)) {
+        rejectEmpty();
+        continue;
+      }
 
       // Track default publish channel (most recent ACCEPTED incoming) —
       // deliberately after §14.5 validation: a rejected message from an
@@ -962,8 +1091,11 @@ export class ChannelRegistry {
       // Determine whether to trigger inference
       let triggerInference = true;
       if (this.shouldTriggerInference) {
-        const textContent = message.content
-          .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+        // The text the agent's context gets, as the push lane's filter reads
+        // it: the converted text blocks, a placeholder or reference stub
+        // among them, and a text block's non-string text as empty text.
+        const textContent = convertedContent
+          .filter((b): b is ContentBlock & { type: 'text' } => b.type === 'text')
           .map((b) => b.text)
           .join('\n');
         triggerInference = this.shouldTriggerInference(
@@ -1006,7 +1138,10 @@ export class ChannelRegistry {
           if (result.accepted) markAccepted();
           results.push(result);
         } catch (error) {
-          const err = error as Error & { code?: number };
+          const err = error as Error & { code?: number; field?: string };
+          // -32602 is answered coalesce_invalid; anything else as its message,
+          // a plain Error standing for an internal error (-32603).
+          this.traceCoalesceRejection(serverId, message, err, typeof err.code === 'number' ? err.code : -32603);
           results.push({
             messageId: message.messageId,
             accepted: false,
@@ -1069,20 +1204,34 @@ export class ChannelRegistry {
         (existing.descriptor.metadata as { lazyRegistered?: boolean } | undefined)?.lazyRegistered &&
         label && existing.descriptor.label === channelId
       ) {
-        existing.descriptor.label = label;
-        if (extraMetadata) {
-          existing.descriptor.metadata = { ...existing.descriptor.metadata, ...extraMetadata };
-        }
+        const metadata = extraMetadata
+          ? { ...existing.descriptor.metadata, ...extraMetadata }
+          : existing.descriptor.metadata;
         // The channel now has a real label, not just the bare id — durable.
-        this.appendLabelSighting(
-          existing.descriptor.id,
-          existing.descriptor.label,
-          extractDmMeta(existing.descriptor.metadata),
-        );
+        // Recorded before the live descriptor takes it, since this branch's
+        // guard reads the descriptor: an append that throws leaves the
+        // placeholder, so the next push tries again.
+        this.appendLabelSighting(existing.descriptor.id, label, extractDmMeta(metadata));
+        existing.descriptor.label = label;
+        existing.descriptor.metadata = metadata;
       }
       return;
     }
 
+    // Only persist a REAL label durably. Falling back to the bare
+    // channelId as a placeholder (no server-supplied label at all — e.g. a
+    // Discord DM push missing both channelName and an author name,
+    // framework.ts's derivePushEventChannel) must never overwrite a real
+    // label already on file from a previous boot: after a restart the live
+    // `channels` map starts empty, so THIS is the very branch a
+    // label-less post-restart event takes — recording the placeholder here
+    // would clobber the good label initializeLabelHistoryStore() just
+    // replayed, defeating the entire point of the durable log. The live
+    // descriptor below still carries the placeholder for in-process
+    // routing; only the durable write is skipped when there's no real
+    // label to record. A real label is recorded before the entry exists:
+    // an append that throws registers nothing, so the next push tries again.
+    if (label) this.appendLabelSighting(channelId, label, extractDmMeta(extraMetadata));
     const key = `${serverId}:${channelId}`;
     this.channels.set(key, {
       serverId,
@@ -1095,19 +1244,6 @@ export class ChannelRegistry {
       },
       open: false,
     });
-    // Only persist a REAL label durably. Falling back to the bare
-    // channelId as a placeholder (no server-supplied label at all — e.g. a
-    // Discord DM push missing both channelName and an author name,
-    // framework.ts's derivePushEventChannel) must never overwrite a real
-    // label already on file from a previous boot: after a restart the live
-    // `channels` map starts empty, so THIS is the very branch a
-    // label-less post-restart event takes — recording the placeholder here
-    // would clobber the good label initializeLabelHistoryStore() just
-    // replayed, defeating the entire point of the durable log. The live
-    // descriptor above still carries the placeholder for in-process
-    // routing; only the durable write is skipped when there's no real
-    // label to record.
-    if (label) this.appendLabelSighting(channelId, label, extractDmMeta(extraMetadata));
     this.emitTraceFn({
       type: 'mcpl:channel-lazy-registered',
       serverId,
@@ -1271,7 +1407,7 @@ export class ChannelRegistry {
    * Get synthesized tool definitions for channel operations.
    */
   getChannelTools(): ToolDefinition[] {
-    return CHANNEL_TOOL_DEFINITIONS;
+    return this.channelTools;
   }
 
   /**
@@ -1353,8 +1489,9 @@ export class ChannelRegistry {
 
     // Resolve the outbound locus the SAME way routeSpeech does, so the agent is
     // told the channel its speech will actually land in: a conversation fork's
-    // home channel, else this turn's triggering channel (single trunk agent —
-    // item-3 redux), else the global default (heartbeats). Without this, a fork
+    // home channel, else this turn's channel (single trunk agent — item-3
+    // redux: its locus, else its triggering channel), else the global default
+    // (heartbeats). Without this, a fork
     // was advertised the global locus but published somewhere else; and a trunk
     // agent was told the wrong channel under concurrency.
     const home = agentName ? this.homeChannelResolver?.(agentName) : undefined;
@@ -1495,6 +1632,15 @@ export class ChannelRegistry {
     }
   }
 
+  /**
+   * Each writer appends its record here before it changes memory for it, so
+   * an append that throws, as on a full disk, fails the operation with that
+   * change unmade, and memory and the log still agree. A retry then records
+   * the change rather than finding it in memory already, where
+   * setDesiredState's same-state return would record nothing, and a restart
+   * replays what memory held. appendLabelSighting keeps the same order for
+   * the label history.
+   */
   private appendLifecycleEvent(event: ChannelLifecycleEvent): void {
     this.store?.appendToStateJson(CHANNEL_LIFECYCLE_LOG_ID, event);
   }
@@ -1600,6 +1746,16 @@ export class ChannelRegistry {
     const recipientNameUnchanged = recipientName === undefined || recipientName === this.dmRecipientNames.get(channelId);
     const isDmUnchanged = isDm === undefined || this.dmClassified.get(channelId) === true;
     if (labelUnchanged && recipientIdUnchanged && recipientNameUnchanged && isDmUnchanged) return;
+    // The log first, as for lifecycle events: an append that throws leaves
+    // the history in memory as it was, so the next sighting records it.
+    this.store?.appendToStateJson(CHANNEL_LABEL_HISTORY_LOG_ID, {
+      channelId,
+      label,
+      ts: Date.now(),
+      ...(recipientId ? { recipientId } : {}),
+      ...(recipientName ? { recipientName } : {}),
+      ...(isDm ? { isDm } : {}),
+    } satisfies ChannelLabelSightingEvent);
     this.labelHistory.set(channelId, label);
     let seen = this.allLabelsSeen.get(channelId);
     if (!seen) {
@@ -1610,14 +1766,6 @@ export class ChannelRegistry {
     if (recipientId) this.dmRecipientIds.set(channelId, recipientId);
     if (recipientName) this.dmRecipientNames.set(channelId, recipientName);
     if (isDm) this.dmClassified.set(channelId, true);
-    this.store?.appendToStateJson(CHANNEL_LABEL_HISTORY_LOG_ID, {
-      channelId,
-      label,
-      ts: Date.now(),
-      ...(recipientId ? { recipientId } : {}),
-      ...(recipientName ? { recipientName } : {}),
-      ...(isDm ? { isDm } : {}),
-    } satisfies ChannelLabelSightingEvent);
   }
 
   /**
@@ -1842,7 +1990,6 @@ export class ChannelRegistry {
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
     if (this.desiredStates.get(key)?.state === desired) return;
-    this.desiredStates.set(key, { state: desired, source });
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -1851,6 +1998,7 @@ export class ChannelRegistry {
       source,
       timestamp: new Date().toISOString(),
     });
+    this.desiredStates.set(key, { state: desired, source });
   }
 
   // ==========================================================================
@@ -1870,12 +2018,6 @@ export class ChannelRegistry {
     source: string,
   ): void {
     const key = this.lifecycleKey(serverId, channelId);
-    this.desiredStates.set(key, {
-      state: 'tuned-out',
-      source,
-      tuneOut: params,
-      wakeCount: 0,
-    });
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -1884,6 +2026,12 @@ export class ChannelRegistry {
       tuneOut: params,
       source,
       timestamp: new Date().toISOString(),
+    });
+    this.desiredStates.set(key, {
+      state: 'tuned-out',
+      source,
+      tuneOut: params,
+      wakeCount: 0,
     });
   }
 
@@ -1903,7 +2051,6 @@ export class ChannelRegistry {
     const current = this.desiredStates.get(key);
     if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
     const ended = { params: current.tuneOut, wakeCount: current.wakeCount ?? 0 };
-    this.desiredStates.set(key, { state: nextState, source });
     this.appendLifecycleEvent({
       kind: 'desired-state',
       serverId,
@@ -1912,6 +2059,7 @@ export class ChannelRegistry {
       source,
       timestamp: new Date().toISOString(),
     });
+    this.desiredStates.set(key, { state: nextState, source });
     return ended;
   }
 
@@ -1929,16 +2077,17 @@ export class ChannelRegistry {
     const key = this.lifecycleKey(serverId, channelId);
     const current = this.desiredStates.get(key);
     if (current?.state !== 'tuned-out' || !current.tuneOut) return null;
-    current.wakeCount = (current.wakeCount ?? 0) + 1;
+    const wakeCount = (current.wakeCount ?? 0) + 1;
     this.appendLifecycleEvent({
       kind: 'tune-out-wake',
       serverId,
       channelId,
       epochId: current.tuneOut.epochId,
-      wakeCount: current.wakeCount,
+      wakeCount,
       timestamp: new Date().toISOString(),
     });
-    return { params: current.tuneOut, wakeCount: current.wakeCount };
+    current.wakeCount = wakeCount;
+    return { params: current.tuneOut, wakeCount };
   }
 
   /** Active tune-out params + wake count for a channel, or null. */
@@ -2013,13 +2162,13 @@ export class ChannelRegistry {
       this.setDesiredState(serverId, channel.id, desired, 'legacy-recipe-migration');
     }
 
-    this.migratedLegacyPolicies.add(serverId);
     this.appendLifecycleEvent({
       kind: 'legacy-policy-migrated',
       serverId,
       source: Array.isArray(policy) ? 'allow-list' : policy,
       timestamp: new Date().toISOString(),
     });
+    this.migratedLegacyPolicies.add(serverId);
   }
 
   /**
@@ -2567,11 +2716,13 @@ export class ChannelRegistry {
     // A tuned-out channel is transport-open but attention-diverted; a plain
     // open would silently discard the epoch (and its pending backlog dump).
     // Cancelling is the tune-out coordinator's flow, reached via its own
-    // tool — refuse with the pointer rather than eat the state.
+    // tool — refuse with the pointer rather than eat the state. As an error
+    // result, the agent reads the pointer itself; `data` names the refusal
+    // for an in-process caller.
     if (this.getDesiredState(entry.serverId, input.channelId) === 'tuned-out') {
       return {
         success: false,
-        isError: false,
+        isError: true,
         error:
           `Channel ${input.channelId} is tuned out. Cancel the tune-out ` +
           `(tune_out with mode: 'cancel') to resume normal attention — ` +
@@ -2852,8 +3003,8 @@ export class ChannelRegistry {
    */
   private handleToolSkipReply(input: { reason?: string; wake_in_seconds?: number }): ToolResult {
     // The self-wake itself is armed by the framework (which owns the
-    // EventGate) BEFORE this dispatch; when the gate is absent the framework
-    // strips the field so this confirmation stays truthful.
+    // EventGate) BEFORE this dispatch. Without a gate, a positive timer request
+    // is refused before this successful end-turn handler is reached.
     const wakeSecs = Number(input.wake_in_seconds);
     const selfWake = Number.isFinite(wakeSecs) && wakeSecs > 0
       ? Math.max(1, Math.min(3600, Math.floor(wakeSecs)))
@@ -3014,7 +3165,7 @@ export class ChannelRegistry {
       try {
         await this.openChannelNow(entry, 'opened-by-delivery');
         console.error(
-          `[routeSpeech] ${conversationId}: locus ${channelId} was closed — opened by delivery (speech implies engagement)`,
+          `[routeSpeech] ${conversationId}: locus ${logValue(channelId)} was closed — opened by delivery (speech implies engagement)`,
         );
         this.emitTraceFn({
           type: 'mcpl:channel-opened-by-send',
@@ -3067,7 +3218,7 @@ export class ChannelRegistry {
       return fail(channelId, `server "${entry.serverId}" reported delivered:false for "${channelId}"`);
     }
 
-    console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${channelId} (server=${entry.serverId}, delivered=${delivered})`);
+    console.error(`[routeSpeech] ${conversationId}: routed ${text.length} chars -> ${logValue(channelId)} (server=${entry.serverId}, delivered=${delivered})`);
     this.emitTraceFn({
       type: 'mcpl:speech-routed',
       conversationId,

@@ -237,6 +237,11 @@ export interface FrameworkConfig {
    * effective class (first matching pattern wins); replaces, never merges
    * with, what the providing server declared. Use it to correct or tighten a
    * misclassed tool.
+   *
+   * MCPL tools are named `<toolPrefix>--<tool>`, and toolPrefix defaults to
+   * `mcpl--<serverId>`: server `search` without a toolPrefix needs
+   * `mcpl--search--*`, not `search--*`. A pattern that matches no tool is
+   * reported once its servers have listed their tools.
    */
   toolClassOverrides?: Record<string, string[]>;
 
@@ -282,6 +287,13 @@ export interface FrameworkConfig {
    * messages route to per-channel fork agents spawned from the template
    * agent instead of the primary conversation. If omitted, behavior is
    * unchanged (all messages go to the primary agent).
+   *
+   * @deprecated Per-channel conversation routing is deprecated and will be
+   * removed (anima-research/agent-framework#235). Its 'mention' bind/trigger
+   * rule reads `metadata.mentioned`, which not every channel server sets
+   * (discord-mcpl does not), so on those channels an @-mention neither binds
+   * a fork nor triggers a bound one. Routing still works for now; the
+   * framework logs one `[deprecated]` line at creation when this is set.
    */
   conversations?: ConversationRouterConfig;
 }
@@ -298,6 +310,10 @@ export interface ContextMaintenanceAgentRun {
   pendingAfter?: string;
   progressBefore?: Record<string, unknown>;
   progressAfter?: Record<string, unknown>;
+  /**
+   * The agent's failure in this pass: a tick that threw, or its readiness
+   * that couldn't be read, before the ticks or after them.
+   */
   error?: string;
 }
 
@@ -319,6 +335,12 @@ export interface ContextMaintenanceSnapshot {
     agentName: string;
     ready: boolean;
     pending?: string;
+    /**
+     * Why the agent's readiness can't be read: the context manager refuses
+     * while its strategy's initialization is pending or has failed, and a
+     * strategy can refuse on its own. `ready` is false then.
+     */
+    error?: string;
     progress?: Record<string, unknown>;
   }>;
 }
@@ -399,18 +421,30 @@ export interface InferenceLogEntry {
   success: boolean;
   /** Error message if failed */
   error?: string;
-  /** Request data or blob ID if large */
+  /** Request data or blob ID if large. A stream the framework ended at a
+   *  tool boundary (stopReason 'turn_ended', 'context_budget' or
+   *  'physical_window') records a note in place of the body. */
   request: unknown | { blobId: string };
   /** Response data or blob ID if large (only if successful) */
   response?: unknown | { blobId: string };
   durationMs: number;
+  /** The stream's usage: its final response's, or, for a stream that ended
+   *  without one, the provider rounds it finished before it ended. Exactly
+   *  one entry of a stream carries it, the one its end wrote; a stream whose
+   *  end writes none (a quiesce-abandoned turn, a superseded stream, a
+   *  disposed agent's stream) gets a failure entry that carries it, when it
+   *  had finished a round. One that hadn't has nothing to carry and gets no
+   *  entry. */
   tokenUsage?: {
     input: number;
     output: number;
     cacheCreation?: number;
     cacheRead?: number;
   };
-  /** Stop reason from the model */
+  /** Stop reason from the model, or why the framework ended the stream at a
+   *  tool boundary: 'turn_ended' (a tool result with endTurn), or
+   *  'context_budget' / 'physical_window' (a context-budget or
+   *  physical-window restart). */
   stopReason?: string;
 }
 
